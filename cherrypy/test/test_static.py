@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import io
 import os
+import socket
 import sys
 import platform
 import tempfile
@@ -398,8 +399,48 @@ class StaticTest(helper.CPWebCase):
         self.assertInBody("I couldn't find that thing")
 
     def test_null_bytes(self):
-        self.getPage('/static/\x00')
-        self.assertStatus('404 Not Found')
+        # Why are we working directly with sockets, you ask? In the discussion
+        # of https://bugs.python.org/issue38216 the opinion was voiced that
+        #
+        #   When writing tests of particular out of spec queries such that
+        #   servers can implement good "be lenient in what you accept"
+        #   behavior, it is better not to depend on specific behaviors of a
+        #   given http client library to allow you to do so for such tests.
+        #
+        # ...so I guess we'll do a bit of our own poor-man's HTTP parsing.
+        sock = socket.socket()
+        try:
+            sock.connect((self.HOST, self.PORT))
+            fp = sock.makefile('rwb')
+            fp.write(b'GET /static/\x00 HTTP/1.1\r\n'
+                     b'Host: ' + '{}:{}'.format(
+                        self.HOST, self.PORT).encode('ascii') + b'\r\n\r\n')
+            fp.flush()
+            self.assertEqual(b'HTTP/1.1 404 Not Found\r\n', fp.readline())
+            headers = [
+                line.split(b': ')
+                for line in iter(fp.readline, b'\r\n')]
+            header_dict = dict(headers)
+            self.assertEqual(len(header_dict), len(headers),
+                             "Some headers are duplicated: {}".format(headers))
+
+            self.assertIn(b'Content-Type', header_dict)
+            self.assertEqual(header_dict[b'Content-Type'],
+                             b'text/html;charset=utf-8\r\n')
+            self.assertIn(b'Server', header_dict)
+            self.assertIn(b'Date', header_dict)
+            self.assertIn(b'Content-Length', header_dict)
+            body = fp.read(int(header_dict[b'Content-Length']))
+            self.assertIn(b"The path '/static/\x00' was not found.", body)
+
+            # Connection's still up & usable
+            fp.write(b'HEAD /static/ HTTP/1.1\r\n'
+                     b'Host: ' + '{}:{}'.format(
+                        self.HOST, self.PORT).encode('ascii') + b'\r\n\r\n')
+            fp.flush()
+            self.assertEqual(b'HTTP/1.1 200 OK\r\n', fp.readline())
+        finally:
+            sock.close()
 
     @classmethod
     def unicode_file(cls):
